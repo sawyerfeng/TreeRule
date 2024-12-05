@@ -78,7 +78,7 @@ class PathEncoder(nn.Module):
             # 投影,用于对比学习
             proj_repr = self.proj(path_repr)
             proj_repr = F.normalize(proj_repr, dim=-1)
-            # 计算对比损失
+            # 计算��比损失
             loss = self.cal_loss(proj_repr)
             return loss, proj_repr
         else:
@@ -108,6 +108,7 @@ class PathEncoder(nn.Module):
         # 计算对比损失
         loss = F.cross_entropy(sim, y_true)
         return torch.mean(loss)
+
 
 class TreeEncoder(nn.Module):
     def __init__(self, hidden_size, rel_num, device):
@@ -153,7 +154,7 @@ class TreeEncoder(nn.Module):
             tao: 温度参数
         """
         idxs = torch.arange(sentence_embedding.size(0))
-        y_true = idxs + 1 - idxs % 2 * 2  # 构建标签：相邻样本互为正样本
+        y_true = idxs + 1 - idxs % 2 * 2  # 构��标签：相邻样本互为正样本
         y_true = y_true.to(sentence_embedding.device)
         
         # 计算余弦相似度矩阵
@@ -170,48 +171,83 @@ class TreeEncoder(nn.Module):
         # 计算对比损失
         loss = F.cross_entropy(sim, y_true)
         return torch.mean(loss)
-class ContrastiveLoss(nn.Module):
-    """
-    对比学习损失函数实现 (InfoNCE)
-    """
-    def __init__(self, device, temperature=0.07):
-        """
-        参数:
-            device: 运行设备 (CPU/GPU)
-            temperature: 温度参数，控制分布的平滑程度
-        """
-        super(ContrastiveLoss, self).__init__()
-        self.device = device
-        self.temperature = temperature
-        self.criterion = nn.CrossEntropyLoss()
 
-    def forward(self, features, augmented_features):
+class EntityEncoder(nn.Module):
+    def __init__(self, hidden_size, entity_num, device):
+        super(EntityEncoder, self).__init__()
+        self.hidden_size = hidden_size
+        self.entity_num = entity_num
+        self.device = device
+        
+        # 实体嵌入层
+        self.entity_emb = nn.Embedding(entity_num, hidden_size)
+        
+        # 注意力层
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=2,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        
+        # 投影层
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x, contrast=True):
         """
-        计算对比损失
-        
-        参数:
-            features: 原始样本的特征表示 [batch_size, feature_dim]
-            augmented_features: 增强样本的特征表示 [batch_size, feature_dim]
-            
-        返回:
-            loss: 对比损失值
+        输入: 
+            x - [batch_size, seq_len]的实体ID序列
+            contrast - 是否用于对比学习
         """
-        # 归一化特征向量
-        features = F.normalize(features, dim=1)
-        augmented_features = F.normalize(augmented_features, dim=1)
+        # 获取实体嵌入
+        entity_embeds = self.entity_emb(x)  # [batch_size, seq_len, hidden_size]
         
-        # 计算相似度矩阵
-        similarity_matrix = torch.matmul(features, augmented_features.T) / self.temperature
+        # 自注意力处理实体序列
+        entity_embeds = self.layer_norm(entity_embeds)
+        attn_output, _ = self.attention(
+            entity_embeds, 
+            entity_embeds, 
+            entity_embeds
+        )
         
-        # 构建标签：对角线上的元素为正样本对
-        batch_size = features.shape[0]
-        labels = torch.arange(batch_size).to(self.device)
+        # 平均池化得到整体表示
+        path_repr = torch.mean(attn_output, dim=1)
+        path_repr = self.dropout(path_repr)
         
-        # 计算对比损失（同时考虑正向和反向）
-        loss = (self.criterion(similarity_matrix, labels) + 
-                self.criterion(similarity_matrix.T, labels)) / 2
-                
-        return loss
+        if contrast:
+            # 投影,用于对比学习
+            proj_repr = self.proj(path_repr)
+            proj_repr = F.normalize(proj_repr, dim=-1)
+            # 计算对比损失
+            loss = self.cal_loss(proj_repr)
+            return loss, proj_repr
+        else:
+            return path_repr
+
+    def cal_loss(self, sentence_embedding, tao=0.5):
+        """计算对比学习损失"""
+        idxs = torch.arange(sentence_embedding.size(0))
+        y_true = idxs + 1 - idxs % 2 * 2
+        y_true = y_true.to(sentence_embedding.device)
+        
+        sim = F.cosine_similarity(sentence_embedding.unsqueeze(1), 
+                                sentence_embedding.unsqueeze(0), dim=-1)
+        
+        I = torch.eye(sim.size(0)).to(sim.device)
+        sim = sim - I
+        sim = sim / tao
+        
+        loss = F.cross_entropy(sim, y_true)
+        return torch.mean(loss)
+
 
 class TreeRule(nn.Module):
     def __init__(self, hidden_size, rel_num, device, model_type='base'):

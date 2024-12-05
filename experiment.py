@@ -11,7 +11,7 @@ from sample_path import *
 import sys
 sys.path.append('.')  # 将当前目录添加到Python路径
 from models.entity_predictor import EntityPredictor
-from models.model import TreeEncoder, RulePredictor
+from models.model_agg import TreeEncoder, RulePredictor
 import torch.nn as nn
 from scipy import sparse
 # 定义命名元组，用于存储超参数
@@ -84,8 +84,8 @@ def train_three_stage(args, opt, dataset):
     relation_num = rdict.__len__()
     
     # 初始化模型
-    tree_model = TreeEncoder(opt.emb_size, relation_num, opt.device).to(opt.device)
-    predict_model = RulePredictor(opt.emb_size, relation_num, opt.device).to(opt.device)
+    tree_model = TreeEncoder(opt.emb_size, relation_num, dataset.entity_num, opt.device).to(opt.device)
+    predict_model = RulePredictor(opt.emb_size, relation_num, dataset.entity_num, opt.device).to(opt.device)
     entity_predictor = EntityPredictor(opt.emb_size, dataset.entity_num, opt.device).to(opt.device)
    
     # 初始化优化器
@@ -146,7 +146,7 @@ def train_contrast(model, optimizer, dataloader, opt):
         batch_size = inputs.shape[0]
         seq_len = inputs.shape[1]
         path_len = inputs.shape[2]
-        # 构建输入矩阵：每个样本复制一份
+        # 构建输入矩阵：每个样本复��一份
         input_ids = torch.zeros(2*batch_size, seq_len, path_len, dtype=torch.int64).to(opt.device)
         for i, x in enumerate(inputs):
             input_ids[2*i, :seq_len, :path_len] = x
@@ -227,29 +227,40 @@ def train_joint(tree_model, predict_model, entity_predictor, tree_optimizer, pre
         target_ent[sample_has_zero_path] = 0
 
         # 继续原来的训练流程
-        input_emb = tree_model(inputs, contrast = False)
-        pred_relation = predict_model(input_emb, mode = "transformer")
-        pred_entity = entity_predictor(inputs_entity)
+        input_emb = tree_model(inputs, inputs_entity, contrast = False)
+        pred_relation, pred_entity = predict_model(input_emb, mode = "transformer")
+        # pred_entity = entity_predictor(inputs_entity)
 
         # 计算损失
-        loss_entity = entity_criterion(pred_entity, target_ent)  # target_ent是0/1张量
+        pos_mask = (target_ent == 1)
+        loss_entity = entity_criterion(
+            pred_entity[pos_mask], 
+            target_ent[pos_mask]
+        )
         loss_relation = relation_criterion(pred_relation, target_rel.reshape(-1))
+        # 合并实体预测损失和关系预测损失
+        loss = 0.7 * loss_relation + 0.3 * loss_entity
 
         # 计算实体预测的准确率（可选）
         with torch.no_grad():
             pred_entity_binary = (torch.sigmoid(pred_entity) > 0.9).float()  # 转换为0/1预测
-            entity_acc = (pred_entity_binary == target_ent).float().mean().item()
+            # 只计算target为1的位置的预测准确率
+            target_mask = (target_ent == 1)  # 找出target为1的位置
+            if target_mask.sum() > 0:  # 确保有target为1的样本
+                entity_acc = (pred_entity_binary[target_mask] == target_ent[target_mask]).float().mean().item()
+            else:
+                entity_acc = 0.0
             relation_acc = (pred_relation.argmax(dim=1) == target_rel.reshape(-1)).float().mean().item()
 
         torch.nn.utils.clip_grad_norm_(tree_model.parameters(), max_norm=1.0)
         torch.nn.utils.clip_grad_norm_(predict_model.parameters(), max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(entity_predictor.parameters(), max_norm=1.0)
+        # torch.nn.utils.clip_grad_norm_(entity_predictor.parameters(), max_norm=1.0)
         # 分别进行反向传播
-        loss_relation.backward()  # 使用retain_graph=True保留计算图
+        loss.backward()  # 使用retain_graph=True保留计算图
         tree_optimizer.step()
         predict_optimizer.step()
-        loss_entity.backward()
-        entity_optimizer.step()
+        # loss_entity.backward()
+        # entity_optimizer.step()
         train_acc = ((pred_relation.argmax(dim=1) == target_rel.reshape(-1)).sum() / pred_relation.shape[0]).cpu().numpy()
 
         total_acc += train_acc
@@ -257,8 +268,8 @@ def train_joint(tree_model, predict_model, entity_predictor, tree_optimizer, pre
         
         # 更新进度条描述
         pbar.set_description(
-            f'Training Joint Entity Loss: {loss_entity.item():.4f}, '
-            f'Relation Loss: {loss_relation.item():.4f}, '
+            f'Training Joint Entity Loss: {loss.item():.4f}, '
+            # f'Relation Loss: {loss_relation.item():.4f}, '
             f'Entity Acc: {entity_acc:.4f}, '
             f'Relation Acc: {relation_acc:.4f}'
         )
