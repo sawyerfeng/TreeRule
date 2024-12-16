@@ -12,7 +12,7 @@ def get_opt(args,dataset,joint =True):
     # log_path = "/home/fxy/paper/ContrastRule/logs/last/"+args.exp_name+'_'+str(args.max_path_len)+'_'+str(args.learned_path_len)
     # log_path = "/home/fxy/ContrastRule/logs/abalation/drop/"+args.exp_name+'_'+str(args.hidden_size)+'_'+str(args.max_path_len)+'_'+str(args.learned_path_len)
     # log_path = "/home/fxy/ContrastRule/logs/abalation/augment/"+args.exp_name+'_'+str(args.augment)+'_'+str(args.max_path_len)+'_'+str(args.learned_path_len)
-    log_path = "/home/fxy/thesis/treeRule/logs/init/"+args.exp_name+'_'+str(args.max_path_len)+'_'+str(args.learned_path_len)
+    log_path = "/home/fxy/thesis/treeRule_new/logs/init/"+args.exp_name+'_'+str(args.max_path_len)+'_'+str(args.learned_path_len)
     if not os.path.exists(log_path):
         os.makedirs(log_path)
 
@@ -424,7 +424,7 @@ def get_opt(args,dataset,joint =True):
                 batch_size = args.batch_size,
                 emb_size = args.hidden_size,
                 bn_hidden_size= args.bn_hidden_size,
-                anchor = 100000,
+                anchor = 10000,
                 contrast_ratio = 0.3,
                 predict_ratio = 0.1,
                 none_ratio = 1,
@@ -443,7 +443,7 @@ def get_opt(args,dataset,joint =True):
                 joint_n_epoch = 5,
                 #learning rate
                 contrast_lr = 2e-5,
-                predict_lr = 1e-4,
+                predict_lr = 1e-5,
                 joint_contrast_lr = 2e-5,
                 joint_predict_lr = 2e-5,
                 # other

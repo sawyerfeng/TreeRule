@@ -24,7 +24,15 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default=100, help="increase output verbosity")
     parser.add_argument("--gpu", type=int, default=1, help="increase output verbosity")
     parser.add_argument("--model", default="family", help="increase output verbosity")
-    parser.add_argument("--max_path_len", type=int, default=3, help="increase output verbosity")
+    parser.add_argument("--model_type", type=str, default="hierarchical",
+                      choices=['base', 'hierarchical'],
+                      help="选择模型类型：base-基础模型，hierarchical-层次化模型")
+    parser.add_argument("--num_heads", type=int, default=4,
+                      help="注意力头数")
+    parser.add_argument("--max_path_len", type=int, default=100,
+                      help="最大路径长度")
+    parser.add_argument("--max_tree_paths", type=int, default=100,
+                      help="树中最大路径数")
     parser.add_argument("--learned_path_len", type=int, default=3, help="increase output verbosity")
     parser.add_argument("--sparsity", type=float, default=1, help="increase output verbosity")
     parser.add_argument("--anchor", type=int, default=5000, help="increase output verbosity")

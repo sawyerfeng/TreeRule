@@ -13,111 +13,229 @@ from collections import defaultdict
 import argparse
 from utils import *
 from tqdm import tqdm
-from models.entity_predictor import EntityPredictor
+
 import sys
 import io
 # sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-head2mrr = defaultdict(list)
-head2hit_10 = defaultdict(list)
-head2hit_1 = defaultdict(list)
-head2hit_3 = defaultdict(list)
+import json
+import os
+from datetime import datetime
 
-def kg_completion(opt, rules, dataset):
+def save_prediction_details(save_path, head_rel, rule, source_entity, target_entity, confidence):
+    """记录单个预测的详细信息"""
+    details = {
+        "head_relation": head_rel,
+        "rule_body": rule[1],  # tree_body
+        "confidence": float(confidence),
+        "source_entity": source_entity,
+        "target_entity": target_entity,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    return details
+
+def save_rule_application_stats(save_path, rule_stats):
+    """保存规则应用统计信息"""
+    with open(os.path.join(save_path, "rule_stats.json"), "w") as f:
+        json.dump(rule_stats, f, indent=2)
+
+def save_evaluation_results(save_path, results):
+    """保存评估结果"""
+    with open(os.path.join(save_path, "evaluation_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+def kg_completion(args,rules, dataset):
     """
     Input a set of rules
     Complete Queries from test_rdf based on rules and fact_rdf 
+    Return:
+        msg: 评估结果信息
+        inferred_paths: 推理出的路径
+        inferred_triples: 推理出的三元组（在测试集中的）
+        metrics: 包含所有评估指标的字典
     """
+    # 创建保存结果的目录
+    save_path = os.path.join(args.exp_path, "inference_results")
+    os.makedirs(save_path, exist_ok=True)
+    
+    # 初始化统计信息和返回结果
+    rule_stats = {}
+    prediction_details = []
+    inferred_paths = []  # 存储推理路径
+    inferred_triples = []  # 存储推理出的三元组
+    evaluation_results = {
+        "per_relation": {},
+        "overall": {}
+    }
+    
+    # 初始化评估指标字典
+    metrics = {
+        'head2mrr': defaultdict(list),
+        'head2hit_1': defaultdict(list),
+        'head2hit_3': defaultdict(list),
+        'head2hit_10': defaultdict(list)
+    }
+    
     # 准备数据
     fact_rdf, train_rdf, valid_rdf, test_rdf = dataset.fact_rdf, dataset.train_rdf, dataset.valid_rdf, dataset.test_rdf
+    
+    # 将测试集转换为set，方便查找
+    test_triples = set()
+    for test_sample in test_rdf:
+        h, r, t = test_sample
+        test_triples.add((h, r, t))
+    
     gt = get_gt(dataset)
     idx2ent, ent2idx = dataset.idx2ent, dataset.ent2idx
+    rdict = dataset.get_relation_dict()
+    rel2idx, idx2rel = rdict.rel2idx, rdict.idx2rel
     e_num = len(idx2ent)
-    idx2rel = dataset.rdict.idx2rel
     r2mat = construct_rmat(idx2rel, idx2ent, ent2idx, fact_rdf+train_rdf+valid_rdf)
-    entity_predictor = EntityPredictor(opt.emb_size, dataset.entity_num, opt.device).to(opt.device)
-    entity_predictor = torch.load(opt.exp_path + '/entity_model.pt')
     
-    # 评估指标
-    mrr, hits_1, hits_3, hits_10 = [], [], [], []
+    # 存储每个头部关系的推理结果
+    head2score = {}
     
-    # 批处理大小
-    batch_size = 128
-    
-    # 直接处理测试集
-    pbar = tqdm(test_rdf, desc="处理测试查询")
-    for query_rdf in pbar:
-        q_h, q_r, q_t = parse_rdf(query_rdf)
-        if q_r not in rules:
-            continue
-            
-        h_idx = ent2idx[q_h]
-        t_idx = ent2idx[q_t]
+    # 对每个头部关系进行规则推理
+    for head_rel, rule_list in tqdm(rules.items()):
+        # 初始化该关系的规则统计
+        rule_stats[head_rel] = {
+            "total_rules": len(rule_list),
+            "rules_applied": 0,
+            "new_predictions": 0
+        }
         
-        # 收集所有规则的预测分数
-        final_scores = np.zeros(e_num)
+        # 创建新的分数矩阵（不依赖已知边）
+        score_matrix = sparse.dok_matrix((e_num, e_num))
         
-        # 对每个规则进行处理
-        for rule in rules[q_r]:
+        for rule in rule_list:
             head, tree_body, conf_1, conf_2 = rule
             
-            # 收集路径实体
-            path_entities = []
+            # 计算所有分支路径的可达性矩阵
+            branch_reachable = []
             for branch in tree_body:
-                current = sparse.eye(e_num, format='csr')[h_idx]  # 只取查询实体行
+                # 创建单位矩阵作为起始状态
+                current = sparse.eye(e_num, format='csr')
+                
+                # 沿着路径连续应用关系矩阵来找到可达实体
                 for b_rel in branch:
                     current = current * r2mat[b_rel]
-                path_entities.append(current.toarray().flatten())  # 展平为1维数组
-            
-            # 如果任何路径没有实体，跳过这条规则
-            if any(not path.any() for path in path_entities):
-                continue
                 
-            # 转换为正确的维度 [batch, path_num, entity_num]
-            path_tensor = torch.tensor(path_entities, dtype=torch.float32, device=opt.device)
-            path_tensor = path_tensor.unsqueeze(0)  # 添加batch维度 [1, path_num, entity_num]
+                # 将结果转换为布尔矩阵,表示从每个起点出发可以到达哪些实体
+                branch_reachable.append((current > 0).astype(int))
             
-            with torch.no_grad():
-                pred_scores = entity_predictor(path_tensor)  # 输出应该是 [1, entity_num]
-                final_scores += pred_scores[0].cpu().numpy() * conf_1
-        
-        # 计算排名
-        pred_ranks = np.argsort(final_scores)[::-1]
+            # 对于每个起点，找到通过所有分支都可达的实体
+            path_validity = branch_reachable[0]
+            for mat in branch_reachable[1:]:
+                path_validity = path_validity.multiply(mat > 0)
+            
+            # 获取有效的推理路径
+            rows, cols = path_validity.nonzero()
+            
+            # 记录规则应用情况
+            if len(rows) > 0:
+                rule_stats[head_rel]["rules_applied"] += 1
+            
+            for i, j in zip(rows, cols):
+                score_matrix[i, j] += conf_1
+                
+                # 如果是新预测的边
+                if r2mat[head][i, j] == 0:
+                    rule_stats[head_rel]["new_predictions"] += 1
+                    
+                    # 记录推理路径
+                    path_info = {
+                        "head_relation": head_rel,
+                        "rule_body": [",".join(branch) for branch in tree_body],
+                        "source_entity": idx2ent[i],
+                        "target_entity": idx2ent[j],
+                        "confidence": float(conf_1)
+                    }
+                    inferred_paths.append(path_info)
+                    
+                    # 检查是否在测试集中
+                    if (idx2ent[i], head_rel, idx2ent[j]) in test_triples:
+                        triple = {
+                            "head": idx2ent[i],
+                            "relation": head_rel,
+                            "tail": idx2ent[j],
+                            "confidence": float(conf_1),
+                            "rule_body": [",".join(branch) for branch in tree_body]
+                        }
+                        inferred_triples.append(triple)
+            
+        head2score[head_rel] = score_matrix.tocsr()
+    
+    print(f"\n总共找到 {len(inferred_triples)} 个在测试集中的推理三元组")
+    
+    # 评估
+    mrr, hits_1, hits_3, hits_10 = [], [], [], []
+    
+    # 添加进度条并实时显示指标
+    pbar = tqdm(test_rdf, desc="评估中")
+    for query_rdf in pbar:
+        q_h, q_r, q_t = parse_rdf(query_rdf)
+        if q_r not in head2score:
+            continue
+            
+        pred = head2score[q_r][ent2idx[q_h]].toarray().flatten()
+            
+        pred_ranks = np.argsort(pred)[::-1]    
+
         truth = gt[(q_h, q_r)]
-        truth = [t for t in truth if t != t_idx]
+        truth = [t for t in truth if t!=ent2idx[q_t]]
         
-        truth_idx = []
         filtered_ranks = []
-        for idx in pred_ranks:
-            if idx not in truth and final_scores[idx] > final_scores[t_idx]:
+        for i in range(len(pred_ranks)):
+            idx = pred_ranks[i]
+            if idx not in truth and pred[idx] > pred[ent2idx[q_t]]:
                 filtered_ranks.append(idx)
-            if idx in truth:
-                truth_idx.append(idx)
+                
+        rank = len(filtered_ranks)+1
         
-        rank = len(filtered_ranks) + 1
-        
-        # 更新指标
+        # 更新评估指标
         mrr.append(1.0/rank)
-        head2mrr[q_r].append(1.0/rank)
-        hits_1.append(1 if rank <= 1 else 0)
-        hits_3.append(1 if rank <= 3 else 0)
-        hits_10.append(1 if rank <= 10 else 0)
-        head2hit_1[q_r].append(1 if rank <= 1 else 0)
-        head2hit_3[q_r].append(1 if rank <= 3 else 0)
-        head2hit_10[q_r].append(1 if rank <= 10 else 0)
+        metrics['head2mrr'][q_r].append(1.0/rank)
+        hits_1.append(1 if rank<=1 else 0)
+        hits_3.append(1 if rank<=3 else 0)
+        hits_10.append(1 if rank<=10 else 0)
+        metrics['head2hit_1'][q_r].append(1 if rank<=1 else 0)
+        metrics['head2hit_3'][q_r].append(1 if rank<=3 else 0)
+        metrics['head2hit_10'][q_r].append(1 if rank<=10 else 0)
         
+        # 更新进度条显示当前指标
         pbar.set_postfix({
             'MRR': f'{np.mean(mrr):.4f}',
             'Hits@1': f'{np.mean(hits_1):.4f}',
             'Hits@3': f'{np.mean(hits_3):.4f}',
-            'Hits@10': f'{np.mean(hits_10):.4f}',
-            'Truth_rate': len(truth_idx) / len(pred_ranks)
+            'Hits@10': f'{np.mean(hits_10):.4f}'
         })
+    
+    # 记录每个关系的评估结果
+    for rel in metrics['head2mrr']:
+        evaluation_results["per_relation"][rel] = {
+            "MRR": float(np.mean(metrics['head2mrr'][rel])),
+            "Hits@1": float(np.mean(metrics['head2hit_1'][rel])),
+            "Hits@3": float(np.mean(metrics['head2hit_3'][rel])),
+            "Hits@10": float(np.mean(metrics['head2hit_10'][rel]))
+        }
+    
+    # 记录总体评估结果
+    evaluation_results["overall"] = {
+        "MRR": float(np.mean(mrr)),
+        "Hits@1": float(np.mean(hits_1)),
+        "Hits@3": float(np.mean(hits_3)),
+        "Hits@10": float(np.mean(hits_10))
+    }
+    
+    # 保存统计信息和评估结果
+    save_rule_application_stats(save_path, rule_stats)
+    save_evaluation_results(save_path, evaluation_results)
 
     msg = "MRR: {} Hits@1: {} Hits@3: {} Hits@10: {}".format(
         np.mean(mrr), np.mean(hits_1), np.mean(hits_3), np.mean(hits_10)
     )
-    return msg
+    
+    return msg, inferred_paths, inferred_triples, metrics
 
 def sortSparseMatrix(m, r, rev=True, only_indices=False):
     """ Sort a row in matrix row and return column index
@@ -235,18 +353,18 @@ if __name__ == "__main__":
         print("Head: {} Count: {}".format(head, count))
 
 
-    kg_completion(all_rules, dataset,args)
+    msg, inferred_paths, inferred_triples, metrics = kg_completion(all_rules, dataset,args)
     
     print_msg("Stat on head and hit@1")
-    for head, hits in head2hit_1.items():
+    for head, hits in metrics['head2hit_1'].items():
         print(head, np.mean(hits))
 
     print_msg("Stat on head and hit@10")
-    for head, hits in head2hit_10.items():
+    for head, hits in metrics['head2hit_10'].items():
         print(head, np.mean(hits))
     print_msg("Stat on head and hit@3")
-    for head, hits in head2hit_3.items():
+    for head, hits in metrics['head2hit_3'].items():
         print(head, np.mean(hits))
     print_msg("Stat on head and mrr")
-    for head, mrr in head2mrr.items():
+    for head, mrr in metrics['head2mrr'].items():
         print(head, np.mean(mrr))

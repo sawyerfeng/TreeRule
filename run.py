@@ -3,9 +3,9 @@ from utils import *
 
 # exp_names = ["family","wn18rr","umls","kinship","fb15k-237"]
 commands = []
-# exp_names = ["family/","wn-18rr/","umls/","kinship/","fb15k-237/"]
+exp_names = ["family/","wn-18rr/","umls/","kinship/"]
 
-exp_names = ["family/"]
+# exp_names = ["family/"]
 # exp_names = ["family/"]
 # exp_names=["fb15k-237/"]
 # exp_names=["wn-18rr/"]
@@ -15,7 +15,7 @@ exp_names = ["family/"]
 # exp_names = ["YAGO3-10/"]
 # exp_names = ["yago/"]
 # exp_names = ["umls/"]
-base_path ="/home/fxy/thesis/treeRule/"
+base_path ="/home/fxy/thesis/treeRule_new/"
 dataset_path = base_path+"datasets/"
 model_path = base_path+"saves/init/"
 # model_path = base_path +"saves/abalation/without_contrast"
@@ -29,7 +29,7 @@ for name in exp_names:
     for path in path_len:
         # for learned in learned_path_len:
         learned = path
-        command = "/home/fxy/miniconda3/envs/baichuan/bin/python  main.py  --train --test --get_rule --batch_size 256  --hidden_size 512 --bn_hidden_size 64 --exp_name "+name.replace("/","")+"  --data "+dataset_path+name+" --topk 100 --gpu "+str(gpu)+ " --model "+model_path+" --max_path_len "+str(path)+" --learned_path_len "+str(learned)+" --sparsity 1 --anchor 15000"
+        command = "/home/fxy/miniconda3/envs/baichuan/bin/python  main.py  --train --test --get_rule --batch_size 256  --hidden_size 512 --bn_hidden_size 64 --exp_name "+name.replace("/","")+"  --data "+dataset_path+name+" --topk 100 --gpu "+str(gpu)+ " --model "+model_path+" --max_path_len "+str(path)+" --learned_path_len "+str(learned)+" --sparsity 1 --anchor 10000"
         commands.append(command)
         print_msg("Running expriment: {} path{} learned_path.".format(name,path,learned))
         print("Running command:{}".format(command))

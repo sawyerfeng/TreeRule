@@ -78,7 +78,7 @@ class PathEncoder(nn.Module):
             # 投影,用于对比学习
             proj_repr = self.proj(path_repr)
             proj_repr = F.normalize(proj_repr, dim=-1)
-            # 计算对比损失
+            # 计算��比损失
             loss = self.cal_loss(proj_repr)
             return loss, proj_repr
         else:
@@ -153,7 +153,7 @@ class TreeEncoder(nn.Module):
             tao: 温度参数
         """
         idxs = torch.arange(sentence_embedding.size(0))
-        y_true = idxs + 1 - idxs % 2 * 2  # 构建标签：相邻样本互为正样本
+        y_true = idxs + 1 - idxs % 2 * 2  # 构建���签：相邻样本互为正样本
         y_true = y_true.to(sentence_embedding.device)
         
         # 计算余弦相似度矩阵
@@ -170,6 +170,148 @@ class TreeEncoder(nn.Module):
         # 计算对比损失
         loss = F.cross_entropy(sim, y_true)
         return torch.mean(loss)
+
+class HierarchicalTreeEncoder(nn.Module):
+    def __init__(self, hidden_size, rel_num, device):
+        super(HierarchicalTreeEncoder, self).__init__()
+        self.device = device
+        self.hidden_size = hidden_size
+        
+        # 关系嵌入层
+        self.rel_emb = nn.Embedding(rel_num, hidden_size)
+        
+        # 路径内部的LSTM编码器
+        self.path_lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+            dropout=0.3
+        )
+        
+        # 路径内部的自注意力机制
+        self.path_attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=4,
+            dropout=0.3,
+            batch_first=True
+        )
+        self.path_layer_norm = nn.LayerNorm(hidden_size)
+        
+        # 路径位置编码
+        self.path_pos_encoding = nn.Parameter(torch.randn(1, 100, hidden_size))  # 假设最大路径长度为100
+        
+        # 树中路径间的自注意力机制
+        self.tree_attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=4,
+            dropout=0.3,
+            batch_first=True
+        )
+        self.tree_layer_norm = nn.LayerNorm(hidden_size)
+        
+        # 树中路径位置编码
+        self.tree_pos_encoding = nn.Parameter(torch.randn(1, 100, hidden_size))  # 假设最大树路径数为100
+        
+        # 输出投影层
+        self.projection_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        ).to(device)
+        
+        self.dropout = nn.Dropout(0.3)
+
+    def encode_single_path(self, path):
+        """编码单条路径
+        path: [batch_size, path_len]
+        """
+        # 1. 获取关系嵌入
+        rel_embeds = self.rel_emb(path)  # [batch_size, path_len, hidden_size]
+        
+        # 2. 添加路径位置编码
+        path_len = rel_embeds.size(1)
+        rel_embeds = rel_embeds + self.path_pos_encoding[:, :path_len, :]
+        
+        # 3. LSTM编码
+        lstm_output, _ = self.path_lstm(rel_embeds)  # [batch_size, path_len, hidden_size]
+        
+        # 4. 路径内自注意力
+        path_attn_out, _ = self.path_attention(
+            lstm_output, lstm_output, lstm_output
+        )  # [batch_size, path_len, hidden_size]
+        
+        # 5. 残差连接和层归一化
+        path_repr = self.path_layer_norm(lstm_output + path_attn_out)
+        
+        # 6. 池化得到路径表示
+        path_repr = torch.mean(path_repr, dim=1)  # [batch_size, hidden_size]
+        
+        return path_repr
+
+    def forward(self, paths, contrast=True):
+        """
+        paths: [batch_size, num_paths, path_len] 的关系ID序列
+        contrast: 是否用于对比学习
+        """
+        batch_size, num_paths, path_len = paths.size()
+        
+        # 1. 编码每条路径
+        path_embeddings = []
+        for i in range(num_paths):
+            path_repr = self.encode_single_path(paths[:, i, :])  # [batch_size, hidden_size]
+            path_embeddings.append(path_repr)
+        
+        path_embeddings = torch.stack(path_embeddings, dim=1)  # [batch_size, num_paths, hidden_size]
+        
+        # 2. 添加树中路径位置编码
+        path_embeddings = path_embeddings + self.tree_pos_encoding[:, :num_paths, :]
+        
+        # 3. 树级自注意力
+        tree_attn_out, _ = self.tree_attention(
+            path_embeddings, path_embeddings, path_embeddings
+        )  # [batch_size, num_paths, hidden_size]
+        
+        # 4. 残差连接和层归一化
+        tree_repr = self.tree_layer_norm(path_embeddings + tree_attn_out)
+        
+        # 5. 池化得到最终树表示
+        tree_repr = torch.mean(tree_repr, dim=1)  # [batch_size, hidden_size]
+        tree_repr = self.dropout(tree_repr)
+        
+        if contrast:
+            # 通过投影头进行映射
+            projected_embedding = self.projection_head(tree_repr)
+            projected_embedding = F.normalize(projected_embedding, dim=-1)
+            
+            # 计算对比损失
+            loss = self.cal_loss(projected_embedding)
+            
+            return loss, projected_embedding
+        else:
+            return tree_repr
+
+    def cal_loss(self, sentence_embedding, tao=0.5):
+        """计算对比学习损失（保持原有的损失计算逻辑）"""
+        idxs = torch.arange(sentence_embedding.size(0))
+        y_true = idxs + 1 - idxs % 2 * 2
+        y_true = y_true.to(sentence_embedding.device)
+        
+        # 计算余弦相似度矩阵
+        sim = F.cosine_similarity(sentence_embedding.unsqueeze(1), 
+                                sentence_embedding.unsqueeze(0), dim=-1)
+        
+        # 移除自身相似度
+        I = torch.eye(sim.size(0)).to(sim.device)
+        sim = sim - I
+        
+        # 应用温度系数
+        sim = sim / tao
+        
+        # 计算对比损失
+        loss = F.cross_entropy(sim, y_true)
+        return torch.mean(loss)
+
 class ContrastiveLoss(nn.Module):
     """
     对比学习损失函数实现 (InfoNCE)
